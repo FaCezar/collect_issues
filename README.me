@@ -1,21 +1,59 @@
-# Cortex Cloud Issues Exporter (Commit 1)
+# Cortex Cloud Issues Exporter
+
+Exports Cortex Cloud issues through `/public_api/v1/issue/search`.
+
+## Features
+
+- Automatic pagination in pages of 100
+- CSV streaming
+- Retry with exponential backoff
+- Optional gzip output
+- Progress counters
+- API-side filters
+- Reliable local filters
+- JSON flattening for CSV
 
 ## Install
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install requests
 ```
 
 ## Configure
 
-Copy `config.example.json` to `config.json` and fill in your values.
+```bash
+cp config.example.json config.json
+nano config.json
+```
+
+Add the Cortex Cloud FQDN, Standard API Key ID, and Standard API Key.
 
 ## Run
 
 ```bash
-python get_issues.py --config config.json
+python3 get_issues.py --config config.json
 ```
 
-This initial scaffold authenticates, reads the configuration, prepares pagination,
-and prints where requests will be sent. The next iteration will implement the
-full export loop and CSV streaming.
+Debug mode:
+
+```bash
+python3 get_issues.py --config config.json --debug
+```
+
+## Filtering
+
+`local_filters` are applied after each page is downloaded. The included example exports only:
+
+- Domain: Posture
+- Severity: MEDIUM, HIGH, CRITICAL
+
+Supported local operators:
+
+- `eq`
+- `neq`
+- `in`
+- `not_in`
+- `contains`
+
+`api_filters` are passed unchanged to Cortex Cloud. Keep this empty until the exact API filter schema accepted by the tenant is confirmed.
+
