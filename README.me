@@ -1,0 +1,21 @@
+# Cortex Cloud Issues Exporter (Commit 1)
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+## Configure
+
+Copy `config.example.json` to `config.json` and fill in your values.
+
+## Run
+
+```bash
+python get_issues.py --config config.json
+```
+
+This initial scaffold authenticates, reads the configuration, prepares pagination,
+and prints where requests will be sent. The next iteration will implement the
+full export loop and CSV streaming.
