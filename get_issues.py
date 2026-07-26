@@ -64,6 +64,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print request and pagination diagnostics without exposing secrets.",
     )
+    parser.add_argument(
+        "--debug-payload",
+        action="store_true",
+        help="Print the exact JSON payload sent to Cortex.",
+    )
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        metavar="FIELD=VALUE",
+        help=(
+            "Repeatable API filter. Example: "
+            '--filter "category=IDENTITY" --filter "severity=CRITICAL"'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -110,6 +125,46 @@ def normalize_fqdn(fqdn: str) -> str:
     return fqdn
 
 
+def build_cli_filters(values: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    Convert repeated FIELD=VALUE arguments into Cortex API filters.
+
+    Multiple values for the same field can be passed as comma-separated values,
+    for example:
+        --filter "severity=CRITICAL,HIGH"
+    """
+    filters: List[Dict[str, Any]] = []
+
+    for item in values:
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --filter value {item!r}. Expected FIELD=VALUE."
+            )
+
+        field, raw_value = item.split("=", 1)
+        field = field.strip()
+        values_list = [
+            value.strip()
+            for value in raw_value.split(",")
+            if value.strip()
+        ]
+
+        if not field or not values_list:
+            raise ValueError(
+                f"Invalid --filter value {item!r}. Expected FIELD=VALUE."
+            )
+
+        filters.append(
+            {
+                "field": field,
+                "operator": "in",
+                "value": values_list,
+            }
+        )
+
+    return filters
+
+
 def build_auth_headers(
     api_key: str,
     key_id: str,
@@ -142,6 +197,7 @@ def post_with_retry(
     timeout: int,
     retry_count: int,
     debug: bool,
+    debug_payload: bool,
 ) -> Dict[str, Any]:
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     last_error: Optional[Exception] = None
@@ -164,6 +220,10 @@ def post_with_retry(
                     f" search_to={request_data.get('search_to')}"
                     f" filters={request_data.get('filters', [])}"
                 )
+
+            if debug_payload:
+                print("Request payload:")
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
 
             response = session.post(
                 url,
@@ -265,6 +325,7 @@ def select_summary_fields(
 def collect_issues(
     config: Mapping[str, Any],
     debug: bool,
+    debug_payload: bool,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     fqdn = normalize_fqdn(str(config["fqdn"]))
     path = "/public_api/v1/issue/search"
@@ -303,6 +364,7 @@ def collect_issues(
                 timeout=timeout,
                 retry_count=retry_count,
                 debug=debug,
+                debug_payload=debug_payload,
             )
 
             page = reply.get("DATA", [])
@@ -432,6 +494,9 @@ def main() -> int:
     try:
         config = load_config(args.config)
 
+        if args.filter:
+            config["api_filters"] = build_cli_filters(args.filter)
+
         print_filters(config.get("api_filters", []))
         print(f"Output mode: {config['output_mode']}")
         print(f"Open only: {bool(config.get('open_only', True))}")
@@ -439,6 +504,7 @@ def main() -> int:
         issues, api_count, skipped_resolved = collect_issues(
             config=config,
             debug=args.debug,
+            debug_payload=args.debug_payload,
         )
 
         output_path = write_csv(issues, config)
