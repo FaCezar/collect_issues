@@ -1,23 +1,12 @@
-{
-  "fqdn": "api-stne.xdr.us.paloaltonetworks.com",
+
+  "fqdn": "YOUR_FQDN",
   "key_id": "YOUR_KEY_ID",
   "api_key": "YOUR_STANDARD_API_KEY",
   "page_size": 100,
-  "output": "issues_posture_medium_plus.csv",
+  "output": "issues.csv",
   "retry_count": 5,
   "timeout": 60,
   "gzip": false,
   "api_filters": [],
-  "local_filters": [
-    {
-      "field": "domain",
-      "operator": "in",
-      "value": ["Posture"]
-    },
-    {
-      "field": "severity",
-      "operator": "in",
-      "value": ["MEDIUM", "HIGH", "CRITICAL"]
-    }
-  ]
+  "local_filters": []
 }
