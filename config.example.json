@@ -27,16 +27,5 @@
     "description",
     "remediation"
   ],
-  "api_filters": [
-    {
-      "field": "category",
-      "operator": "in",
-      "value": ["IDENTITY"]
-    },
-    {
-      "field": "severity",
-      "operator": "in",
-      "value": ["CRITICAL"]
-    }
-  ]
+  "api_filters": []
 }
