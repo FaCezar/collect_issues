@@ -4,13 +4,14 @@ Cortex Cloud Issues CSV exporter.
 
 Features:
 - Standard API Key authentication
-- API-side filtering through config.json
+- API-side filtering through CLI arguments
 - FILTER_COUNT-aware pagination
 - Retry handling
 - Full or summary CSV output
 - Issue name included as the first summary column
 - Optional open-only safety filter
 - Optional gzip output
+- Debug output for URL, headers, payload, and response structure
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print request and pagination diagnostics without exposing secrets.",
+        help="Print request, response, and pagination diagnostics without exposing secrets.",
     )
     parser.add_argument(
         "--debug-payload",
@@ -100,7 +101,6 @@ def load_config(path: str) -> Dict[str, Any]:
     config.setdefault("retry_count", 5)
     config.setdefault("timeout", 60)
     config.setdefault("gzip", False)
-    config.setdefault("api_filters", [])
     config.setdefault("output_mode", "summary")
     config.setdefault("summary_fields", DEFAULT_SUMMARY_FIELDS)
     config.setdefault("open_only", True)
@@ -129,8 +129,7 @@ def build_cli_filters(values: Sequence[str]) -> List[Dict[str, Any]]:
     """
     Convert repeated FIELD=VALUE arguments into Cortex API filters.
 
-    Multiple values for the same field can be passed as comma-separated values,
-    for example:
+    Multiple values for the same field can be passed as comma-separated values:
         --filter "severity=CRITICAL,HIGH"
     """
     filters: List[Dict[str, Any]] = []
@@ -165,32 +164,50 @@ def build_cli_filters(values: Sequence[str]) -> List[Dict[str, Any]]:
     return filters
 
 
-def build_auth_headers(
-    api_key: str,
-    key_id: str,
-    method: str,
-    path: str,
-    body: str,
-) -> Dict[str, str]:
-    """
-    Build headers for a Cortex Standard API Key.
-
-    Standard keys are sent directly in the Authorization header. They must not
-    be transformed with HMAC signing. The unused method/path/body arguments are
-    retained so the rest of the working request code does not need to change.
-    """
+def build_auth_headers(api_key: str, key_id: str) -> Dict[str, str]:
+    """Build headers for a Cortex Standard API Key."""
     return {
-        "x-xdr-auth-id": str(key_id),
-        "Authorization": api_key,
-        "Content-Type": "application/json",
         "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": api_key,
+        "x-xdr-auth-id": str(key_id),
     }
+
+
+def mask_header_value(name: str, value: str) -> str:
+    """Hide secrets in debug output."""
+    if name.lower() == "authorization":
+        if len(value) <= 12:
+            return "***"
+        return f"{value[:6]}...{value[-4:]}"
+    return value
+
+
+def unwrap_api_response(response_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cortex returns issue-search data inside a top-level 'reply' object:
+
+        {
+          "reply": {
+            "DATA": [...],
+            "FILTER_COUNT": 21,
+            "TOTAL_COUNT": 1131062
+          }
+        }
+
+    Return that inner object while also accepting an already-unwrapped response.
+    """
+    nested_reply = response_json.get("reply")
+
+    if isinstance(nested_reply, dict):
+        return nested_reply
+
+    return response_json
 
 
 def post_with_retry(
     session: requests.Session,
     url: str,
-    path: str,
     api_key: str,
     key_id: str,
     payload: Dict[str, Any],
@@ -203,23 +220,24 @@ def post_with_retry(
     last_error: Optional[Exception] = None
 
     for attempt in range(1, retry_count + 1):
-        headers = build_auth_headers(
-            api_key=api_key,
-            key_id=key_id,
-            method="POST",
-            path=path,
-            body=body,
-        )
+        headers = build_auth_headers(api_key=api_key, key_id=key_id)
 
         try:
             if debug:
                 request_data = payload.get("request_data", {})
+
+                print("=" * 80)
+                print(f"Request attempt: {attempt}/{retry_count}")
+                print(f"URL: {url}")
+                print("Headers:")
+                for name, value in headers.items():
+                    print(f"  {name}: {mask_header_value(name, value)}")
                 print(
-                    "Request:"
+                    "Pagination:"
                     f" search_from={request_data.get('search_from')}"
                     f" search_to={request_data.get('search_to')}"
-                    f" filters={request_data.get('filters', [])}"
                 )
+                print(f"Filters: {request_data.get('filters', [])}")
 
             if debug_payload:
                 print("Request payload:")
@@ -232,22 +250,34 @@ def post_with_retry(
                 timeout=timeout,
             )
 
+            if debug:
+                print(f"HTTP status: {response.status_code}")
+                print(f"Response preview: {response.text[:1000]}")
+                print("=" * 80)
+
             if response.status_code in {429, 500, 502, 503, 504}:
                 raise requests.HTTPError(
-                    f"Retryable API response {response.status_code}: {response.text[:1000]}",
+                    f"Retryable API response {response.status_code}: "
+                    f"{response.text[:1000]}",
                     response=response,
                 )
 
             response.raise_for_status()
-            reply = response.json()
+            response_json = response.json()
+
+            if not isinstance(response_json, dict):
+                raise ValueError("The API returned a non-object JSON response.")
+
+            reply = unwrap_api_response(response_json)
 
             if not isinstance(reply, dict):
-                raise ValueError("The API returned a non-object JSON response.")
+                raise ValueError("The API reply field is not a JSON object.")
 
             return reply
 
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
+
             if attempt >= retry_count:
                 break
 
@@ -259,7 +289,9 @@ def post_with_retry(
             )
             time.sleep(delay)
 
-    raise RuntimeError(f"API request failed after {retry_count} attempts: {last_error}")
+    raise RuntimeError(
+        f"API request failed after {retry_count} attempts: {last_error}"
+    )
 
 
 def flatten_json(
@@ -324,6 +356,7 @@ def select_summary_fields(
 
 def collect_issues(
     config: Mapping[str, Any],
+    filters: Sequence[Mapping[str, Any]],
     debug: bool,
     debug_payload: bool,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
@@ -332,7 +365,6 @@ def collect_issues(
     url = f"{fqdn}{path}"
 
     page_size = int(config["page_size"])
-    filters = list(config.get("api_filters", []))
     retry_count = int(config["retry_count"])
     timeout = int(config["timeout"])
     open_only = bool(config.get("open_only", True))
@@ -348,7 +380,7 @@ def collect_issues(
 
             payload = {
                 "request_data": {
-                    "filters": filters,
+                    "filters": list(filters),
                     "search_from": search_from,
                     "search_to": search_to,
                 }
@@ -357,7 +389,6 @@ def collect_issues(
             reply = post_with_retry(
                 session=session,
                 url=url,
-                path=path,
                 api_key=str(config["api_key"]),
                 key_id=str(config["key_id"]),
                 payload=payload,
@@ -370,16 +401,13 @@ def collect_issues(
             page = reply.get("DATA", [])
             if page is None:
                 page = []
+
             if not isinstance(page, list):
                 raise ValueError("The API DATA field is not an array.")
 
             if filter_count is None:
                 raw_count = reply.get("FILTER_COUNT")
-                if raw_count is None:
-                    filter_count = len(page)
-                else:
-                    filter_count = int(raw_count)
-
+                filter_count = len(page) if raw_count is None else int(raw_count)
                 print(f"API matched issues: {filter_count}")
 
             for issue in page:
@@ -416,6 +444,7 @@ def all_fieldnames(rows: Iterable[Mapping[str, Any]]) -> List[str]:
     preferred = ["name", "id", "severity", "status.progress", "category"]
 
     materialized = list(rows)
+
     for field in preferred:
         if any(field in row for row in materialized):
             fieldnames.append(field)
@@ -448,6 +477,7 @@ def write_csv(
     gzip_enabled = bool(config.get("gzip", False))
 
     output = Path(str(config["output"]))
+
     if gzip_enabled and output.suffix != ".gz":
         output = output.with_name(output.name + ".gz")
 
@@ -477,6 +507,7 @@ def write_csv(
 
 def print_filters(filters: Sequence[Mapping[str, Any]]) -> None:
     print("API filters:")
+
     if not filters:
         print("    (none)")
         return
@@ -493,16 +524,15 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
+        filters = build_cli_filters(args.filter)
 
-        if args.filter:
-            config["api_filters"] = build_cli_filters(args.filter)
-
-        print_filters(config.get("api_filters", []))
+        print_filters(filters)
         print(f"Output mode: {config['output_mode']}")
         print(f"Open only: {bool(config.get('open_only', True))}")
 
         issues, api_count, skipped_resolved = collect_issues(
             config=config,
+            filters=filters,
             debug=args.debug,
             debug_payload=args.debug_payload,
         )
@@ -527,4 +557,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
