@@ -1,33 +1,23 @@
 # Cortex Cloud Issues Exporter
 
-Stable v1 exporter for Cortex Cloud Issues.
+Exports Cortex Cloud issues to CSV using the Issues Search API.
 
-This version intentionally has **no interactive menu**. Category, severity, and any other supported API filters are defined in `config.json`.
+## What changed in v1.1
 
-## Features
-
-- API-side filtering
-- Pagination in pages of up to 100 issues
-- Uses `FILTER_COUNT` when returned by the API
-- CSV streaming
-- Retry with exponential backoff
-- Optional gzip output
-- Debug mode
-- Nested JSON flattening
-
-## Requirements
-
-- Python 3.9 or later
-- Cortex Cloud Standard API Key
-- Python package `requests`
+- Adds `output_mode`: `summary` or `full`
+- Includes the issue `name` as the first summary column
+- Adds `open_only: true`
+- Excludes issues whose status is `Resolved` or `Closed`
+- Keeps API-side filters in `config.json`
+- Retains `FILTER_COUNT` pagination
+- Writes Excel-friendly UTF-8 CSV
 
 ## Installation
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -38,100 +28,90 @@ Copy the example:
 cp config.example.json config.json
 ```
 
-Edit `config.json`:
+Then update:
 
 ```json
 {
-  "fqdn": "api-yourfqdn.xdr.us.paloaltonetworks.com",
+  "fqdn": "https://api-your-tenant.xdr.us.paloaltonetworks.com",
   "key_id": "YOUR_KEY_ID",
-  "api_key": "YOUR_STANDARD_API_KEY",
-  "page_size": 100,
-  "output": "issues.csv",
-  "retry_count": 5,
-  "timeout": 60,
-  "gzip": false,
-  "api_filters": [
-    {
-      "field": "category",
-      "operator": "in",
-      "value": ["IDENTITY"]
-    },
-    {
-      "field": "severity",
-      "operator": "in",
-      "value": ["CRITICAL"]
-    }
-  ]
+  "api_key": "YOUR_API_KEY",
+  "output_mode": "summary",
+  "open_only": true
 }
 ```
 
-The filter objects are sent directly to Cortex Cloud.
+Do not commit `config.json`, because it contains the API key.
 
-Multiple filter objects are combined by the API, so this example means:
+## Summary export
 
-```text
-category = IDENTITY
-AND
-severity = CRITICAL
-```
-
-Do not add `local_filters`. This exporter does not download the whole tenant and filter afterward.
-
-## Run
-
-```bash
-python get_issues.py --config config.json
-```
-
-## Debug mode
-
-```bash
-python get_issues.py \
-  --config config.json \
-  --debug
-```
-
-Debug mode prints the request body and response metadata:
-
-```text
-TOTAL_COUNT=1130969, FILTER_COUNT=149, DATA=100
-```
-
-## Pagination
-
-The API accepts at most 100 issues per request.
-
-The exporter increments:
-
-```text
-search_from: 0, 100, 200, ...
-search_to:   100, 200, 300, ...
-```
-
-It stops when one of these conditions is met:
-
-- exported records reach `FILTER_COUNT`;
-- the API returns fewer than `page_size`;
-- the API returns an empty `DATA` array.
-
-## Output
-
-The file name is controlled by:
+The default mode is:
 
 ```json
-"output": "issues.csv"
+"output_mode": "summary"
 ```
 
-For gzip output:
+The CSV begins with:
+
+```text
+name,id,severity,status.progress,category,...
+```
+
+The fields are controlled by:
 
 ```json
-"gzip": true,
-"output": "issues.csv.gz"
+"summary_fields": [
+  "name",
+  "id",
+  "severity",
+  "status.progress",
+  "category",
+  "domain",
+  "detection.method",
+  "asset_providers",
+  "asset_accounts",
+  "asset_names",
+  "asset_types",
+  "asset_regions",
+  "observation_time",
+  "last_update_timestamp",
+  "description",
+  "remediation"
+]
 ```
 
-## Examples
+## Full export
 
-### Critical identity issues
+To export every field returned by the API:
+
+```json
+"output_mode": "full"
+```
+
+The exporter still places important fields such as `name`, `id`, `severity`,
+`status.progress`, and `category` near the beginning when they exist.
+
+## Open issues only
+
+Set:
+
+```json
+"open_only": true
+```
+
+This safety check excludes records with:
+
+- `status.progress = Resolved`
+- `status.progress = Closed`
+
+It works even when the API-side status filter is unavailable or uses a different
+operator.
+
+The category and severity are still filtered by the API, so the exporter does
+not scan the entire tenant.
+
+## API filters
+
+Example:
 
 ```json
 "api_filters": [
@@ -148,42 +128,40 @@ For gzip output:
 ]
 ```
 
-### Medium, high, and critical vulnerability issues
+Once the exact supported Cortex status filter is confirmed from the browser
+request, it can also be added here. Keep `open_only: true` as an additional
+safety check.
 
-```json
-"api_filters": [
-  {
-    "field": "category",
-    "operator": "in",
-    "value": ["VULNERABILITY"]
-  },
-  {
-    "field": "severity",
-    "operator": "in",
-    "value": ["MEDIUM", "HIGH", "CRITICAL"]
-  }
-]
+## Run
+
+```bash
+python get_issues.py --config config.json
 ```
 
-### No API filters
+Debug mode:
 
-```json
-"api_filters": []
+```bash
+python get_issues.py --config config.json --debug
 ```
 
-Be careful: an empty filter list can export the entire tenant.
-
-## Security
-
-Never commit `config.json`.
-
-The included `.gitignore` excludes:
+Expected completion output:
 
 ```text
-config.json
-*.csv
-*.csv.gz
-.venv/
+API matched: 21
+Resolved/closed skipped locally: 4
+Exported: 17
+CSV created: /Users/you/collect_issues/issues.csv
 ```
 
-If an API key appears in a screenshot, recording, chat, or Git commit, revoke it and create a new one.
+## Open the result on macOS
+
+```bash
+open issues.csv
+```
+
+Or reveal it in Finder:
+
+```bash
+open .
+```
+
