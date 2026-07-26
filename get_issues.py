@@ -45,29 +45,23 @@ def main():
         "request_data": {
             "filters": cfg.get("filters", []),
             "search_from": 0,
-            "search_to": cfg.get("page_size", 1000),
-            "sort": [
-                {
-                    "field": "id",
-                    "keyword": "desc"
-                }
-            ]
+            "search_to": cfg.get("page_size", 1000)
         }
     }
 
     print("Headers:")
-    debug_headers = headers(cfg).copy()
-    debug_headers["Authorization"] = "***REDACTED***"
-    print(json.dumps(debug_headers, indent=2))
+    dbg = headers(cfg).copy()
+    dbg["Authorization"] = "***REDACTED***"
+    print(json.dumps(dbg, indent=2))
 
-    print("\nRequest Body:")
+    print("\nBody:")
     print(json.dumps(body, indent=2))
 
     print("\nSending request...\n")
 
     try:
         response = requests.post(
-            url=url,
+            url,
             headers=headers(cfg),
             json=body,
             timeout=60,
@@ -81,29 +75,13 @@ def main():
             print(response.text)
             sys.exit(1)
 
+        print(json.dumps(data, indent=2))
+
         if response.status_code != 200:
-            print(json.dumps(data, indent=2))
             sys.exit(1)
 
-        reply = data.get("reply", {})
-
-        print("=" * 60)
-        print("Request Successful")
-        print("=" * 60)
-
-        print(f"Total Issues    : {reply.get('total_count')}")
-        print(f"Returned Issues : {reply.get('result_count')}")
-
-        issues = reply.get("issues", [])
-
-        if issues:
-            print("\nFirst Issue:\n")
-            print(json.dumps(issues[0], indent=2))
-        else:
-            print("\nNo issues returned.")
-
     except requests.exceptions.RequestException as e:
-        print(f"Request failed:\n{e}")
+        print(f"\nRequest failed:\n{e}")
         sys.exit(1)
 
 
