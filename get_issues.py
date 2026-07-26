@@ -45,7 +45,7 @@ def main():
         "request_data": {
             "filters": cfg.get("filters", []),
             "search_from": 0,
-            "search_to": cfg.get("page_size", 1000)
+            "search_to": cfg.get("page_size", 100)
         }
     }
 
