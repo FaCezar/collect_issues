@@ -37,7 +37,7 @@ def main():
     print(" Cortex Cloud Issues Exporter")
     print("=" * 60)
     print(f"Endpoint : {url}")
-    print(f"Page Size: {cfg.get('page_size', 1000)}")
+    print(f"Page Size: {cfg.get('page_size', 100)}")
     print(f"Output   : {cfg.get('output', 'issues.csv')}")
     print()
 
