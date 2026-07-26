@@ -1,5 +1,5 @@
 {
-  "fqdn": "https://api-your-tenant.xdr.us.paloaltonetworks.com",
+  "fqdn": "https://api-stne.xdr.us.paloaltonetworks.com",
   "key_id": "YOUR_KEY_ID",
   "api_key": "YOUR_API_KEY",
   "page_size": 100,
