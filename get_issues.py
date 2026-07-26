@@ -1,61 +1,216 @@
 #!/usr/bin/env python3
-"""Export Cortex Cloud issues to CSV using API-side filters from config.json."""
+"""
+Cortex Cloud Issues CSV exporter.
+
+Features:
+- Standard API Key authentication
+- API-side filtering through config.json
+- FILTER_COUNT-aware pagination
+- Retry handling
+- Full or summary CSV output
+- Issue name included as the first summary column
+- Optional open-only safety filter
+- Optional gzip output
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import gzip
+import hashlib
+import hmac
 import json
-import os
 import sys
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, TextIO
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 import requests
 
-API_PATH = "/public_api/v1/issue/search"
-MAX_PAGE_SIZE = 100
+
+DEFAULT_SUMMARY_FIELDS = [
+    "name",
+    "id",
+    "severity",
+    "status.progress",
+    "category",
+    "domain",
+    "detection.method",
+    "asset_providers",
+    "asset_accounts",
+    "asset_names",
+    "asset_types",
+    "asset_regions",
+    "observation_time",
+    "last_update_timestamp",
+    "description",
+    "remediation",
+]
+
+RESOLVED_STATES = {
+    "resolved",
+    "closed",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Export Cortex Cloud issues to CSV.")
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to the JSON configuration file. Default: config.json",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print request and pagination diagnostics without exposing secrets.",
+    )
+    return parser.parse_args()
 
 
 def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as file:
-        config = json.load(file)
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-    required = ("fqdn", "key_id", "api_key")
-    missing = [field for field in required if not config.get(field)]
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
 
+    required = ["fqdn", "key_id", "api_key"]
+    missing = [key for key in required if not config.get(key)]
     if missing:
-        raise ValueError(
-            "Missing required configuration field(s): "
-            + ", ".join(missing)
-        )
+        raise ValueError(f"Missing required configuration value(s): {', '.join(missing)}")
 
-    filters = config.get("api_filters", [])
-    if not isinstance(filters, list):
-        raise ValueError("api_filters must be a JSON array.")
+    config.setdefault("page_size", 100)
+    config.setdefault("output", "issues.csv")
+    config.setdefault("retry_count", 5)
+    config.setdefault("timeout", 60)
+    config.setdefault("gzip", False)
+    config.setdefault("api_filters", [])
+    config.setdefault("output_mode", "summary")
+    config.setdefault("summary_fields", DEFAULT_SUMMARY_FIELDS)
+    config.setdefault("open_only", True)
+
+    output_mode = str(config["output_mode"]).lower()
+    if output_mode not in {"summary", "full"}:
+        raise ValueError("output_mode must be either 'summary' or 'full'.")
+    config["output_mode"] = output_mode
+
+    page_size = int(config["page_size"])
+    if page_size < 1:
+        raise ValueError("page_size must be greater than zero.")
+    config["page_size"] = page_size
 
     return config
 
 
-def build_url(config: Dict[str, Any]) -> str:
-    fqdn = str(config["fqdn"]).strip()
-
-    for prefix in ("https://", "http://"):
-        if fqdn.startswith(prefix):
-            fqdn = fqdn[len(prefix):]
-
-    return f"https://{fqdn.rstrip('/')}{API_PATH}"
+def normalize_fqdn(fqdn: str) -> str:
+    return fqdn.strip().rstrip("/")
 
 
-def build_headers(config: Dict[str, Any]) -> Dict[str, str]:
+def build_auth_headers(
+    api_key: str,
+    key_id: str,
+    method: str,
+    path: str,
+    body: str,
+) -> Dict[str, str]:
+    """
+    Build Cortex API Standard API Key headers.
+
+    The signature format matches the Cortex XDR/Cortex Cloud Standard API Key
+    authentication flow:
+        nonce + timestamp + key_id + method + path + body
+    """
+    timestamp = str(int(time.time() * 1000))
+    nonce = str(int(time.time() * 1000000))
+
+    auth_string = f"{nonce}{timestamp}{key_id}{method}{path}{body}"
+    signature = hmac.new(
+        api_key.encode("utf-8"),
+        auth_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
     return {
-        "Authorization": str(config["api_key"]),
-        "x-xdr-auth-id": str(config["key_id"]),
+        "x-xdr-timestamp": timestamp,
+        "x-xdr-nonce": nonce,
+        "x-xdr-auth-id": key_id,
+        "Authorization": signature,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+
+
+def post_with_retry(
+    session: requests.Session,
+    url: str,
+    path: str,
+    api_key: str,
+    key_id: str,
+    payload: Dict[str, Any],
+    timeout: int,
+    retry_count: int,
+    debug: bool,
+) -> Dict[str, Any]:
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, retry_count + 1):
+        headers = build_auth_headers(
+            api_key=api_key,
+            key_id=key_id,
+            method="POST",
+            path=path,
+            body=body,
+        )
+
+        try:
+            if debug:
+                request_data = payload.get("request_data", {})
+                print(
+                    "Request:"
+                    f" search_from={request_data.get('search_from')}"
+                    f" search_to={request_data.get('search_to')}"
+                    f" filters={request_data.get('filters', [])}"
+                )
+
+            response = session.post(
+                url,
+                headers=headers,
+                data=body.encode("utf-8"),
+                timeout=timeout,
+            )
+
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise requests.HTTPError(
+                    f"Retryable API response {response.status_code}: {response.text[:1000]}",
+                    response=response,
+                )
+
+            response.raise_for_status()
+            reply = response.json()
+
+            if not isinstance(reply, dict):
+                raise ValueError("The API returned a non-object JSON response.")
+
+            return reply
+
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt >= retry_count:
+                break
+
+            delay = min(2 ** (attempt - 1), 30)
+            print(
+                f"Request attempt {attempt}/{retry_count} failed: {exc}. "
+                f"Retrying in {delay}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"API request failed after {retry_count} attempts: {last_error}")
 
 
 def flatten_json(
@@ -63,329 +218,258 @@ def flatten_json(
     parent_key: str = "",
     separator: str = ".",
 ) -> Dict[str, Any]:
+    """
+    Flatten nested dictionaries.
+
+    Lists are retained as JSON strings so a CSV row remains one issue per row.
+    Keys that already contain dots, such as 'status.progress', are preserved.
+    """
     flattened: Dict[str, Any] = {}
 
-    if isinstance(value, dict):
-        for key, child_value in value.items():
-            new_key = (
-                f"{parent_key}{separator}{key}"
-                if parent_key
-                else str(key)
-            )
-            flattened.update(
-                flatten_json(
-                    child_value,
-                    parent_key=new_key,
-                    separator=separator,
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_text = str(key)
+            new_key = f"{parent_key}{separator}{key_text}" if parent_key else key_text
+
+            if isinstance(child, Mapping):
+                flattened.update(flatten_json(child, new_key, separator))
+            elif isinstance(child, list):
+                flattened[new_key] = json.dumps(
+                    child,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 )
-            )
-    elif isinstance(value, list):
-        flattened[parent_key] = json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+            else:
+                flattened[new_key] = child
     else:
-        flattened[parent_key] = value
+        flattened[parent_key or "value"] = value
 
     return flattened
 
 
-def request_page(
-    session: requests.Session,
-    url: str,
-    headers: Dict[str, str],
-    api_filters: List[Dict[str, Any]],
-    search_from: int,
-    search_to: int,
-    max_retries: int,
-    timeout: int,
-    debug: bool,
+def get_status(issue: Mapping[str, Any]) -> str:
+    direct = issue.get("status.progress")
+    if direct is not None:
+        return str(direct).strip()
+
+    status = issue.get("status")
+    if isinstance(status, Mapping):
+        progress = status.get("progress")
+        if progress is not None:
+            return str(progress).strip()
+
+    return ""
+
+
+def is_open_issue(issue: Mapping[str, Any]) -> bool:
+    status = get_status(issue).casefold()
+    return status not in RESOLVED_STATES
+
+
+def select_summary_fields(
+    flattened_issue: Mapping[str, Any],
+    summary_fields: Sequence[str],
 ) -> Dict[str, Any]:
-    body = {
-        "request_data": {
-            "filters": api_filters,
-            "search_from": search_from,
-            "search_to": search_to,
-        }
-    }
+    return {field: flattened_issue.get(field, "") for field in summary_fields}
 
-    if debug:
-        print("\nRequest body:")
-        print(json.dumps(body, indent=2))
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = session.post(
-                url,
-                headers=headers,
-                json=body,
+def collect_issues(
+    config: Mapping[str, Any],
+    debug: bool,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    fqdn = normalize_fqdn(str(config["fqdn"]))
+    path = "/public_api/v1/issue/search"
+    url = f"{fqdn}{path}"
+
+    page_size = int(config["page_size"])
+    filters = list(config.get("api_filters", []))
+    retry_count = int(config["retry_count"])
+    timeout = int(config["timeout"])
+    open_only = bool(config.get("open_only", True))
+
+    issues: List[Dict[str, Any]] = []
+    search_from = 0
+    filter_count: Optional[int] = None
+    skipped_resolved = 0
+
+    with requests.Session() as session:
+        while filter_count is None or search_from < filter_count:
+            search_to = search_from + page_size
+
+            payload = {
+                "request_data": {
+                    "filters": filters,
+                    "search_from": search_from,
+                    "search_to": search_to,
+                }
+            }
+
+            reply = post_with_retry(
+                session=session,
+                url=url,
+                path=path,
+                api_key=str(config["api_key"]),
+                key_id=str(config["key_id"]),
+                payload=payload,
                 timeout=timeout,
+                retry_count=retry_count,
+                debug=debug,
             )
 
-            if response.status_code == 200:
-                payload = response.json()
+            page = reply.get("DATA", [])
+            if page is None:
+                page = []
+            if not isinstance(page, list):
+                raise ValueError("The API DATA field is not an array.")
 
-                if debug:
-                    reply = payload.get("reply", {})
-                    data = reply.get("DATA", [])
-                    print(
-                        "Response metadata: "
-                        f"TOTAL_COUNT={reply.get('TOTAL_COUNT')}, "
-                        f"FILTER_COUNT={reply.get('FILTER_COUNT')}, "
-                        f"DATA={len(data) if isinstance(data, list) else 'invalid'}"
-                    )
+            if filter_count is None:
+                raw_count = reply.get("FILTER_COUNT")
+                if raw_count is None:
+                    filter_count = len(page)
+                else:
+                    filter_count = int(raw_count)
 
-                return payload
+                print(f"API matched issues: {filter_count}")
 
-            if response.status_code == 429 or response.status_code >= 500:
-                wait_seconds = min(2 ** attempt, 30)
-                print(
-                    f"\nTemporary HTTP {response.status_code}. "
-                    f"Retrying in {wait_seconds}s "
-                    f"({attempt}/{max_retries})..."
-                )
-                time.sleep(wait_seconds)
-                continue
+            for issue in page:
+                if not isinstance(issue, dict):
+                    continue
 
-            print(f"\nHTTP Status: {response.status_code}")
+                if open_only and not is_open_issue(issue):
+                    skipped_resolved += 1
+                    continue
 
-            try:
-                print(json.dumps(response.json(), indent=2))
-            except ValueError:
-                print(response.text)
+                issues.append(issue)
 
-            raise RuntimeError(
-                f"Non-retryable API error: HTTP {response.status_code}"
-            )
-
-        except requests.exceptions.RequestException as error:
-            if attempt == max_retries:
-                raise
-
-            wait_seconds = min(2 ** attempt, 30)
+            processed = min(search_from + len(page), filter_count)
             print(
-                f"\nRequest error: {error}\n"
-                f"Retrying in {wait_seconds}s "
-                f"({attempt}/{max_retries})..."
+                f"Processed {processed} / {filter_count}"
+                f" | retained {len(issues)} open issue(s)"
             )
-            time.sleep(wait_seconds)
 
-    raise RuntimeError("Maximum retries reached.")
+            if not page:
+                break
+
+            search_from += len(page)
+
+            if len(page) < page_size:
+                break
+
+    return issues, int(filter_count or 0), skipped_resolved
 
 
-def open_output(path: str, compress: bool) -> TextIO:
-    if compress:
-        return gzip.open(
-            path,
-            "wt",
-            encoding="utf-8-sig",
-            newline="",
+def all_fieldnames(rows: Iterable[Mapping[str, Any]]) -> List[str]:
+    fieldnames: List[str] = []
+    seen = set()
+
+    preferred = ["name", "id", "severity", "status.progress", "category"]
+
+    materialized = list(rows)
+    for field in preferred:
+        if any(field in row for row in materialized):
+            fieldnames.append(field)
+            seen.add(field)
+
+    for row in materialized:
+        for field in row.keys():
+            if field not in seen:
+                seen.add(field)
+                fieldnames.append(field)
+
+    return fieldnames
+
+
+def open_output_file(path: Path, gzip_enabled: bool) -> TextIO:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if gzip_enabled:
+        return gzip.open(path, "wt", encoding="utf-8", newline="")
+
+    return path.open("w", encoding="utf-8-sig", newline="")
+
+
+def write_csv(
+    issues: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> Path:
+    output_mode = str(config["output_mode"])
+    summary_fields = list(config.get("summary_fields", DEFAULT_SUMMARY_FIELDS))
+    gzip_enabled = bool(config.get("gzip", False))
+
+    output = Path(str(config["output"]))
+    if gzip_enabled and output.suffix != ".gz":
+        output = output.with_name(output.name + ".gz")
+
+    flattened_rows = [flatten_json(issue) for issue in issues]
+
+    if output_mode == "summary":
+        rows = [
+            select_summary_fields(flattened, summary_fields)
+            for flattened in flattened_rows
+        ]
+        fieldnames = summary_fields
+    else:
+        rows = flattened_rows
+        fieldnames = all_fieldnames(rows)
+
+    with open_output_file(output, gzip_enabled) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
         )
+        writer.writeheader()
+        writer.writerows(rows)
 
-    return open(
-        path,
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    )
+    return output
 
 
-def print_filters(filters: List[Dict[str, Any]]) -> None:
+def print_filters(filters: Sequence[Mapping[str, Any]]) -> None:
     print("API filters:")
-
     if not filters:
-        print("  None")
+        print("    (none)")
         return
 
-    for rule in filters:
-        print(
-            f"  {rule.get('field')} "
-            f"{rule.get('operator')} "
-            f"{rule.get('value')}"
-        )
+    for item in filters:
+        field = item.get("field")
+        operator = item.get("operator")
+        value = item.get("value")
+        print(f"    {field} {operator} {value}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export Cortex Cloud issues to CSV"
-    )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="Path to config.json",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Print request bodies and response metadata",
-    )
-    args = parser.parse_args()
+def main() -> int:
+    args = parse_args()
 
     try:
         config = load_config(args.config)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        print(f"Configuration error: {error}")
-        sys.exit(1)
 
-    url = build_url(config)
-    headers = build_headers(config)
-    api_filters = config.get("api_filters", [])
+        print_filters(config.get("api_filters", []))
+        print(f"Output mode: {config['output_mode']}")
+        print(f"Open only: {bool(config.get('open_only', True))}")
 
-    page_size = min(
-        max(int(config.get("page_size", MAX_PAGE_SIZE)), 1),
-        MAX_PAGE_SIZE,
-    )
-    output_file = str(config.get("output", "issues.csv"))
-    max_retries = int(config.get("retry_count", 5))
-    timeout = int(config.get("timeout", 60))
-    compress = bool(config.get("gzip", False))
+        issues, api_count, skipped_resolved = collect_issues(
+            config=config,
+            debug=args.debug,
+        )
 
-    if compress and not output_file.endswith(".gz"):
-        output_file += ".gz"
+        output_path = write_csv(issues, config)
 
-    if os.path.exists(output_file):
-        os.remove(output_file)
+        print()
+        print(f"API matched: {api_count}")
+        print(f"Resolved/closed skipped locally: {skipped_resolved}")
+        print(f"Exported: {len(issues)}")
+        print(f"CSV created: {output_path.resolve()}")
 
-    search_from = 0
-    exported = 0
-    page_number = 0
-    filtered_count: Optional[int] = None
-    writer: Optional[csv.DictWriter] = None
-    csv_file: Optional[TextIO] = None
-    started_at = time.time()
-    session = requests.Session()
-
-    print("=" * 72)
-    print(" Cortex Cloud Issues Exporter")
-    print("=" * 72)
-    print(f"Endpoint       : {url}")
-    print(f"Page size      : {page_size}")
-    print(f"Output         : {output_file}")
-    print(f"Started        : {datetime.now(timezone.utc).isoformat()}")
-    print_filters(api_filters)
-    print("=" * 72)
-
-    try:
-        while True:
-            search_to = search_from + page_size
-            page_number += 1
-
-            payload = request_page(
-                session=session,
-                url=url,
-                headers=headers,
-                api_filters=api_filters,
-                search_from=search_from,
-                search_to=search_to,
-                max_retries=max_retries,
-                timeout=timeout,
-                debug=args.debug,
-            )
-
-            reply = payload.get("reply", {})
-            issues = reply.get("DATA", [])
-
-            if not isinstance(issues, list):
-                raise RuntimeError(
-                    "Unexpected API response: reply.DATA is not a list."
-                )
-
-            api_filter_count = reply.get("FILTER_COUNT")
-            if isinstance(api_filter_count, int):
-                filtered_count = api_filter_count
-
-            if not issues:
-                break
-
-            flattened_issues = [
-                flatten_json(issue)
-                for issue in issues
-            ]
-
-            if writer is None:
-                fieldnames = sorted(
-                    {
-                        key
-                        for issue in flattened_issues
-                        for key in issue.keys()
-                    }
-                )
-
-                csv_file = open_output(output_file, compress)
-                writer = csv.DictWriter(
-                    csv_file,
-                    fieldnames=fieldnames,
-                    extrasaction="ignore",
-                )
-                writer.writeheader()
-
-            for issue in flattened_issues:
-                writer.writerow(issue)
-
-            if csv_file is not None:
-                csv_file.flush()
-
-            exported += len(issues)
-            elapsed = time.time() - started_at
-            rate = exported / elapsed if elapsed > 0 else 0
-            target = (
-                str(filtered_count)
-                if filtered_count is not None
-                else "unknown"
-            )
-
-            print(
-                f"\rPage {page_number:>5} | "
-                f"Exported {exported:>8}/{target:<8} | "
-                f"{rate:>7.1f} issues/sec",
-                end="",
-                flush=True,
-            )
-
-            search_from += len(issues)
-
-            if filtered_count is not None and exported >= filtered_count:
-                break
-
-            if len(issues) < page_size:
-                break
+        return 0
 
     except KeyboardInterrupt:
-        print("\n\nExport interrupted by the user.")
-        print(f"Exported before interruption: {exported}")
-        sys.exit(130)
-
-    except Exception as error:
-        print(f"\n\nExport failed: {error}")
-        sys.exit(1)
-
-    finally:
-        session.close()
-
-        if csv_file is not None:
-            csv_file.close()
-
-    elapsed = time.time() - started_at
-    file_size_mb = (
-        os.path.getsize(output_file) / 1024 / 1024
-        if os.path.exists(output_file)
-        else 0
-    )
-
-    print("\n")
-    print("=" * 72)
-    print(" Export complete")
-    print("=" * 72)
-    print(f"Filtered count : {filtered_count}")
-    print(f"Exported       : {exported} issues")
-    print(f"Pages          : {page_number}")
-    print(f"Output         : {output_file}")
-    print(f"File size      : {file_size_mb:.2f} MB")
-    print(f"Elapsed        : {elapsed:.1f} seconds")
-    print("=" * 72)
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 
