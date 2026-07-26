@@ -1,40 +1,26 @@
-# Cortex Cloud Issues Exporter v1.2
+# Cortex Cloud Issues Exporter v1.2 Stable
 
-Exports Cortex Cloud issues to CSV.
-
-## Included behavior
+This build continues using `config.json`.
 
 - Standard API Key authentication
-- API-side category, severity, and open-status filtering
-- FILTER_COUNT pagination
-- Summary or full CSV mode
-- Issue name included in the CSV
-- Automatic `https://` normalization
-- Retry handling
-- Optional gzip output
+- API-side category and severity filters
+- Local exclusion of `Resolved` and `Closed`
+- Issue name as the first summary column
+- Summary and full output modes
+- FILTER_COUNT-aware pagination
 
-## Install
+## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json
+nano config.json
 ```
-
-Edit `config.json` and add your Cortex Cloud FQDN, key ID, and API key.
 
 ## Run
 
 ```bash
 python get_issues.py --config config.json --debug
 ```
-
-The generated file is written to the path configured in `output`, normally:
-
-```text
-issues.csv
-```
-
-Do not commit `config.json`, because it contains credentials.
-
