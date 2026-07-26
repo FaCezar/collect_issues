@@ -18,8 +18,6 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
-import hashlib
-import hmac
 import json
 import sys
 import time
@@ -47,6 +45,12 @@ DEFAULT_SUMMARY_FIELDS = [
     "description",
     "remediation",
 ]
+
+RESOLVED_STATES = {
+    "resolved",
+    "closed",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export Cortex Cloud issues to CSV.")
@@ -106,30 +110,6 @@ def normalize_fqdn(fqdn: str) -> str:
     return fqdn
 
 
-def build_api_filters(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Return the configured API filters and, when open_only is enabled, add the
-    supported Cortex status filter for all built-in open states.
-    """
-    filters = [dict(item) for item in config.get("api_filters", [])]
-
-    if bool(config.get("open_only", True)):
-        filters = [
-            item
-            for item in filters
-            if item.get("field") not in {"status", "status.progress"}
-        ]
-        filters.append(
-            {
-                "field": "status.progress",
-                "operator": "in",
-                "value": ["New", "In Progress"],
-            }
-        )
-
-    return filters
-
-
 def build_auth_headers(
     api_key: str,
     key_id: str,
@@ -138,27 +118,15 @@ def build_auth_headers(
     body: str,
 ) -> Dict[str, str]:
     """
-    Build Cortex API Standard API Key headers.
+    Build headers for a Cortex Standard API Key.
 
-    The signature format matches the Cortex XDR/Cortex Cloud Standard API Key
-    authentication flow:
-        nonce + timestamp + key_id + method + path + body
+    Standard keys are sent directly in the Authorization header. They must not
+    be transformed with HMAC signing. The unused method/path/body arguments are
+    retained so the rest of the working request code does not need to change.
     """
-    timestamp = str(int(time.time() * 1000))
-    nonce = str(int(time.time() * 1000000))
-
-    auth_string = f"{nonce}{timestamp}{key_id}{method}{path}{body}"
-    signature = hmac.new(
-        api_key.encode("utf-8"),
-        auth_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
     return {
-        "x-xdr-timestamp": timestamp,
-        "x-xdr-nonce": nonce,
-        "x-xdr-auth-id": key_id,
-        "Authorization": signature,
+        "x-xdr-auth-id": str(key_id),
+        "Authorization": api_key,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -268,35 +236,50 @@ def flatten_json(
     return flattened
 
 
+def get_status(issue: Mapping[str, Any]) -> str:
+    direct = issue.get("status.progress")
+    if direct is not None:
+        return str(direct).strip()
+
+    status = issue.get("status")
+    if isinstance(status, Mapping):
+        progress = status.get("progress")
+        if progress is not None:
+            return str(progress).strip()
+
+    return ""
+
+
+def is_open_issue(issue: Mapping[str, Any]) -> bool:
+    status = get_status(issue).casefold()
+    return status not in RESOLVED_STATES
+
+
 def select_summary_fields(
     flattened_issue: Mapping[str, Any],
     summary_fields: Sequence[str],
 ) -> Dict[str, Any]:
-    row = {field: flattened_issue.get(field, "") for field in summary_fields}
-
-    # Public Issues API normally returns "name". Some raw issue payloads expose
-    # the same value as "issue_name", so keep a safe fallback.
-    if "name" in row and not row["name"]:
-        row["name"] = flattened_issue.get("issue_name", "")
-
-    return row
+    return {field: flattened_issue.get(field, "") for field in summary_fields}
 
 
 def collect_issues(
     config: Mapping[str, Any],
     debug: bool,
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[Dict[str, Any]], int, int]:
     fqdn = normalize_fqdn(str(config["fqdn"]))
     path = "/public_api/v1/issue/search"
     url = f"{fqdn}{path}"
 
     page_size = int(config["page_size"])
-    filters = build_api_filters(config)
+    filters = list(config.get("api_filters", []))
     retry_count = int(config["retry_count"])
     timeout = int(config["timeout"])
+    open_only = bool(config.get("open_only", True))
+
     issues: List[Dict[str, Any]] = []
     search_from = 0
     filter_count: Optional[int] = None
+    skipped_resolved = 0
 
     with requests.Session() as session:
         while filter_count is None or search_from < filter_count:
@@ -338,11 +321,20 @@ def collect_issues(
                 print(f"API matched issues: {filter_count}")
 
             for issue in page:
-                if isinstance(issue, dict):
-                    issues.append(issue)
+                if not isinstance(issue, dict):
+                    continue
+
+                if open_only and not is_open_issue(issue):
+                    skipped_resolved += 1
+                    continue
+
+                issues.append(issue)
 
             processed = min(search_from + len(page), filter_count)
-            print(f"Exported {processed} / {filter_count}")
+            print(
+                f"Processed {processed} / {filter_count}"
+                f" | retained {len(issues)} open issue(s)"
+            )
 
             if not page:
                 break
@@ -352,7 +344,7 @@ def collect_issues(
             if len(page) < page_size:
                 break
 
-    return issues, int(filter_count or 0)
+    return issues, int(filter_count or 0), skipped_resolved
 
 
 def all_fieldnames(rows: Iterable[Mapping[str, Any]]) -> List[str]:
@@ -440,11 +432,11 @@ def main() -> int:
     try:
         config = load_config(args.config)
 
-        print_filters(build_api_filters(config))
+        print_filters(config.get("api_filters", []))
         print(f"Output mode: {config['output_mode']}")
         print(f"Open only: {bool(config.get('open_only', True))}")
 
-        issues, api_count = collect_issues(
+        issues, api_count, skipped_resolved = collect_issues(
             config=config,
             debug=args.debug,
         )
@@ -453,6 +445,7 @@ def main() -> int:
 
         print()
         print(f"API matched: {api_count}")
+        print(f"Resolved/closed skipped locally: {skipped_resolved}")
         print(f"Exported: {len(issues)}")
         print(f"CSV created: {output_path.resolve()}")
 
