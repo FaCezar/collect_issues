@@ -1,5 +1,5 @@
 {
-  "fqdn": "YOUR_FQDN",
+  "fqdn": "api-yourfqdn.xdr.us.paloaltonetworks.com",
   "key_id": "YOUR_KEY_ID",
   "api_key": "YOUR_STANDARD_API_KEY",
   "page_size": 100,
@@ -12,7 +12,7 @@
       "field": "category",
       "operator": "in",
       "value": [
-        "CONFIGURATION"
+        "IDENTITY"
       ]
     },
     {
