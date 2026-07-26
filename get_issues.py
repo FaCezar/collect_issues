@@ -15,7 +15,7 @@ def load_config(path):
 def headers(cfg):
     return {
         "Authorization": cfg["api_key"],
-        "x-xdr-auth-id": cfg["key_id"],
+        "x-xdr-auth-id": str(cfg["key_id"]),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -31,44 +31,76 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-
     url = build_url(cfg)
 
-    print("== Cortex Cloud Issues Exporter ==")
+    print("=" * 60)
+    print(" Cortex Cloud Issues Exporter")
+    print("=" * 60)
     print(f"Endpoint : {url}")
     print(f"Page Size: {cfg.get('page_size', 1000)}")
     print(f"Output   : {cfg.get('output', 'issues.csv')}")
+    print()
 
     body = {
         "request_data": {
             "filters": cfg.get("filters", []),
             "search_from": 0,
             "search_to": cfg.get("page_size", 1000),
-            "sort": {
-                "field": "creation_time",
-                "keyword": "asc"
-            }
+            "sort": [
+                {
+                    "field": "id",
+                    "keyword": "desc"
+                }
+            ]
         }
     }
+
+    print("Headers:")
+    debug_headers = headers(cfg).copy()
+    debug_headers["Authorization"] = "***REDACTED***"
+    print(json.dumps(debug_headers, indent=2))
+
+    print("\nRequest Body:")
+    print(json.dumps(body, indent=2))
 
     print("\nSending request...\n")
 
     try:
         response = requests.post(
-            url,
+            url=url,
             headers=headers(cfg),
             json=body,
             timeout=60,
         )
 
-        print(f"HTTP Status: {response.status_code}")
-        print()
+        print(f"HTTP Status: {response.status_code}\n")
 
         try:
             data = response.json()
-            print(json.dumps(data, indent=2))
         except Exception:
             print(response.text)
+            sys.exit(1)
+
+        if response.status_code != 200:
+            print(json.dumps(data, indent=2))
+            sys.exit(1)
+
+        reply = data.get("reply", {})
+
+        print("=" * 60)
+        print("Request Successful")
+        print("=" * 60)
+
+        print(f"Total Issues    : {reply.get('total_count')}")
+        print(f"Returned Issues : {reply.get('result_count')}")
+
+        issues = reply.get("issues", [])
+
+        if issues:
+            print("\nFirst Issue:\n")
+            print(json.dumps(issues[0], indent=2))
+        else:
+            print("\nNo issues returned.")
 
     except requests.exceptions.RequestException as e:
         print(f"Request failed:\n{e}")
