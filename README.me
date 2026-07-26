@@ -1,15 +1,8 @@
-# Cortex Cloud Issues Exporter v1.2 Stable
+# Cortex Cloud Issues Exporter v1.3
 
-This build continues using `config.json`.
+Complete exporter with command-line filters.
 
-- Standard API Key authentication
-- API-side category and severity filters
-- Local exclusion of `Resolved` and `Closed`
-- Issue name as the first summary column
-- Summary and full output modes
-- FILTER_COUNT-aware pagination
-
-## Setup
+## Install
 
 ```bash
 python3 -m venv .venv
@@ -19,8 +12,62 @@ cp config.example.json config.json
 nano config.json
 ```
 
-## Run
+Keep credentials and connection settings in `config.json`.
+
+## Run with CLI filters
 
 ```bash
-python get_issues.py --config config.json --debug
+python get_issues.py \
+  --config config.json \
+  --filter "category=IDENTITY" \
+  --filter "severity=CRITICAL" \
+  --debug
 ```
+
+Print the exact request body:
+
+```bash
+python get_issues.py \
+  --config config.json \
+  --filter "category=IDENTITY" \
+  --filter "severity=CRITICAL" \
+  --debug \
+  --debug-payload
+```
+
+Multiple values for the same field:
+
+```bash
+python get_issues.py \
+  --config config.json \
+  --filter "severity=CRITICAL,HIGH"
+```
+
+When `--filter` is supplied, CLI filters replace `api_filters` from `config.json`.
+When no `--filter` is supplied, the exporter uses `api_filters` from the config.
+
+## Output
+
+The default output file is:
+
+```text
+issues.csv
+```
+
+Summary mode includes the issue name as the first column.
+
+Set:
+
+```json
+"output_mode": "full"
+```
+
+to export all flattened fields.
+
+With:
+
+```json
+"open_only": true
+```
+
+the exporter removes `Resolved` and `Closed` issues locally before writing CSV.
