@@ -1,59 +1,194 @@
 # Cortex Cloud Issues Exporter
 
-Exports Cortex Cloud issues through `/public_api/v1/issue/search`.
+Exports Cortex Cloud issues to CSV through:
+
+```text
+POST /public_api/v1/issue/search
+```
+
+The exporter applies **Category** and **Severity** in the API request. It does not download the entire tenant and filter locally.
 
 ## Features
 
-- Automatic pagination in pages of 100
-- CSV streaming
+- Interactive Category and Severity menu
+- API-side filtering
+- Pagination in pages of up to 100 issues
+- Uses `FILTER_COUNT` to stop after all matching issues are exported
 - Retry with exponential backoff
+- CSV streaming
 - Optional gzip output
-- Progress counters
-- API-side filters
-- Reliable local filters
-- JSON flattening for CSV
+- Debug mode with request and response metadata
 
-## Install
+## Requirements
+
+- Python 3.9 or later
+- A Cortex Cloud Standard API Key
+- `requests`
+
+## Installation
 
 ```bash
-python3 -m pip install requests
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Configure
+## Configuration
+
+Copy the example:
 
 ```bash
 cp config.example.json config.json
-nano config.json
 ```
 
-Add the Cortex Cloud FQDN, Standard API Key ID, and Standard API Key.
+Edit `config.json`:
 
-## Run
+```json
+{
+  "fqdn": "api-yourfqdn.xdr.us.paloaltonetworks.com",
+  "key_id": "YOUR_KEY_ID",
+  "api_key": "YOUR_STANDARD_API_KEY",
+  "page_size": 100,
+  "output": "issues.csv",
+  "retry_count": 5,
+  "timeout": 60,
+  "gzip": false,
+  "api_filters": [
+    {
+      "field": "category",
+      "operator": "in",
+      "value": ["CONFIGURATION"]
+    },
+    {
+      "field": "severity",
+      "operator": "in",
+      "value": ["CRITICAL"]
+    }
+  ]
+}
+```
+
+Do not commit `config.json`, because it contains credentials.
+
+## Interactive mode
+
+Run:
 
 ```bash
-python3 get_issues.py --config config.json
+python get_issues.py --config config.json
 ```
 
-Debug mode:
+When running in a terminal, the menu opens automatically.
+
+Example:
+
+```text
+Select one or more categories:
+
+  1. ATTACK PATH
+  2. CODE
+  3. CONFIGURATION
+  4. DATA
+  5. IDENTITY
+  6. POSTURE
+  7. VULNERABILITY
+  8. ALL
+
+Enter selections separated by commas [8]: 3
+```
+
+Then:
+
+```text
+Select one or more severities:
+
+  1. LOW
+  2. MEDIUM
+  3. HIGH
+  4. CRITICAL
+  5. ALL
+
+Enter selections separated by commas [5]: 4
+```
+
+The request sent to Cortex Cloud will contain:
+
+```json
+{
+  "request_data": {
+    "filters": [
+      {
+        "field": "category",
+        "operator": "in",
+        "value": ["CONFIGURATION"]
+      },
+      {
+        "field": "severity",
+        "operator": "in",
+        "value": ["CRITICAL"]
+      }
+    ],
+    "search_from": 0,
+    "search_to": 100,
+    "sort": {
+      "field": "observation_time",
+      "keyword": "desc"
+    }
+  }
+}
+```
+
+Multiple filter objects are combined by the API, so the result must match the selected category **and** severity.
+
+## Non-interactive mode
+
+Use the filters stored in `config.json`:
 
 ```bash
-python3 get_issues.py --config config.json --debug
+python get_issues.py \
+  --config config.json \
+  --non-interactive
 ```
 
-## Filtering
+This is appropriate for cron jobs and pipelines.
 
-`local_filters` are applied after each page is downloaded. The included example exports only:
+## Debug mode
 
-- Domain: Posture
-- Severity: MEDIUM, HIGH, CRITICAL
+```bash
+python get_issues.py \
+  --config config.json \
+  --interactive \
+  --debug
+```
 
-Supported local operators:
+Debug output includes the request body and response metadata:
 
-- `eq`
-- `neq`
-- `in`
-- `not_in`
-- `contains`
+```text
+TOTAL_COUNT=1130969, FILTER_COUNT=149, DATA=100
+```
 
-`api_filters` are passed unchanged to Cortex Cloud. Keep this empty until the exact API filter schema accepted by the tenant is confirmed.
+The exporter stops when it reaches `FILTER_COUNT`, or when the API returns fewer than the requested page size.
 
+## Output
+
+The default interactive filename is based on the selections:
+
+```text
+issues_configuration_critical.csv
+```
+
+Press Enter at the filename prompt to accept the default.
+
+## Security
+
+Keep these files out of Git:
+
+```text
+config.json
+*.csv
+*.csv.gz
+.venv/
+```
+
+If an API key is displayed in a screenshot, terminal recording, chat, or commit, revoke it and create a new one.
