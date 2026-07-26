@@ -1,4 +1,5 @@
-"""Export Cortex Cloud issues to CSV with API-side category/severity filters."""
+#!/usr/bin/env python3
+"""Export Cortex Cloud issues to CSV using API-side filters from config.json."""
 
 from __future__ import annotations
 
@@ -17,23 +18,6 @@ import requests
 API_PATH = "/public_api/v1/issue/search"
 MAX_PAGE_SIZE = 100
 
-CATEGORY_OPTIONS = [
-    "ATTACK PATH",
-    "CODE",
-    "CONFIGURATION",
-    "DATA",
-    "IDENTITY",
-    "POSTURE",
-    "VULNERABILITY",
-]
-
-SEVERITY_OPTIONS = [
-    "LOW",
-    "MEDIUM",
-    "HIGH",
-    "CRITICAL",
-]
-
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as file:
@@ -47,6 +31,10 @@ def load_config(path: str) -> Dict[str, Any]:
             "Missing required configuration field(s): "
             + ", ".join(missing)
         )
+
+    filters = config.get("api_filters", [])
+    if not isinstance(filters, list):
+        raise ValueError("api_filters must be a JSON array.")
 
     return config
 
@@ -103,153 +91,6 @@ def flatten_json(
     return flattened
 
 
-def choose_multiple(
-    title: str,
-    options: List[str],
-) -> List[str]:
-    while True:
-        print(f"\n{title}\n")
-
-        for index, value in enumerate(options, start=1):
-            print(f"  {index}. {value}")
-
-        all_index = len(options) + 1
-        print(f"  {all_index}. ALL")
-
-        raw = input(
-            f"\nEnter selections separated by commas [{all_index}]: "
-        ).strip()
-
-        if not raw:
-            return []
-
-        try:
-            selected_numbers = {
-                int(item.strip())
-                for item in raw.split(",")
-                if item.strip()
-            }
-        except ValueError:
-            print("Invalid input. Use numbers separated by commas.")
-            continue
-
-        if all_index in selected_numbers:
-            return []
-
-        if not selected_numbers:
-            print("Select at least one option or ALL.")
-            continue
-
-        if any(
-            number < 1 or number > len(options)
-            for number in selected_numbers
-        ):
-            print("One or more selections are invalid.")
-            continue
-
-        return [
-            options[number - 1]
-            for number in sorted(selected_numbers)
-        ]
-
-
-def build_interactive_api_filters() -> List[Dict[str, Any]]:
-    print("\n" + "=" * 72)
-    print(" Interactive filter selection")
-    print("=" * 72)
-
-    categories = choose_multiple(
-        "Select one or more categories:",
-        CATEGORY_OPTIONS,
-    )
-
-    severities = choose_multiple(
-        "Select one or more severities:",
-        SEVERITY_OPTIONS,
-    )
-
-    filters: List[Dict[str, Any]] = []
-
-    if categories:
-        filters.append(
-            {
-                "field": "category",
-                "operator": "in",
-                "value": categories,
-            }
-        )
-
-    if severities:
-        filters.append(
-            {
-                "field": "severity",
-                "operator": "in",
-                "value": severities,
-            }
-        )
-
-    return filters
-
-
-def values_for_filter(
-    filters: List[Dict[str, Any]],
-    field: str,
-) -> List[str]:
-    for rule in filters:
-        if rule.get("field") == field:
-            value = rule.get("value", [])
-            return value if isinstance(value, list) else [str(value)]
-
-    return []
-
-
-def default_output_name(filters: List[Dict[str, Any]]) -> str:
-    categories = values_for_filter(filters, "category")
-    severities = values_for_filter(filters, "severity")
-
-    category_part = (
-        "-".join(
-            value.lower().replace(" ", "_")
-            for value in categories
-        )
-        if categories
-        else "all_categories"
-    )
-
-    severity_part = (
-        "-".join(value.lower() for value in severities)
-        if severities
-        else "all_severities"
-    )
-
-    return f"issues_{category_part}_{severity_part}.csv"
-
-
-def confirm_export(
-    filters: List[Dict[str, Any]],
-    output_file: str,
-) -> bool:
-    categories = values_for_filter(filters, "category")
-    severities = values_for_filter(filters, "severity")
-
-    print("\n" + "-" * 72)
-    print("Export summary")
-    print("-" * 72)
-    print(
-        "Categories : "
-        + (", ".join(categories) if categories else "ALL")
-    )
-    print(
-        "Severities : "
-        + (", ".join(severities) if severities else "ALL")
-    )
-    print(f"Output     : {output_file}")
-    print("-" * 72)
-
-    answer = input("Start export? [Y/n]: ").strip().lower()
-    return answer in ("", "y", "yes")
-
-
 def request_page(
     session: requests.Session,
     url: str,
@@ -266,10 +107,6 @@ def request_page(
             "filters": api_filters,
             "search_from": search_from,
             "search_to": search_to,
-            "sort": {
-                "field": "observation_time",
-                "keyword": "desc",
-            },
         }
     }
 
@@ -291,11 +128,12 @@ def request_page(
 
                 if debug:
                     reply = payload.get("reply", {})
+                    data = reply.get("DATA", [])
                     print(
                         "Response metadata: "
                         f"TOTAL_COUNT={reply.get('TOTAL_COUNT')}, "
                         f"FILTER_COUNT={reply.get('FILTER_COUNT')}, "
-                        f"DATA={len(reply.get('DATA', []))}"
+                        f"DATA={len(data) if isinstance(data, list) else 'invalid'}"
                     )
 
                 return payload
@@ -353,13 +191,11 @@ def open_output(path: str, compress: bool) -> TextIO:
     )
 
 
-def print_filter_summary(
-    filters: List[Dict[str, Any]],
-) -> None:
+def print_filters(filters: List[Dict[str, Any]]) -> None:
     print("API filters:")
 
     if not filters:
-        print("  None — all categories and severities")
+        print("  None")
         return
 
     for rule in filters:
@@ -380,27 +216,11 @@ def main() -> None:
         help="Path to config.json",
     )
     parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Select category and severity through a terminal menu",
-    )
-    parser.add_argument(
-        "--non-interactive",
-        action="store_true",
-        help="Use api_filters and output from config.json",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print request bodies and response metadata",
     )
     args = parser.parse_args()
-
-    if args.interactive and args.non_interactive:
-        print(
-            "Use either --interactive or --non-interactive, not both."
-        )
-        sys.exit(2)
 
     try:
         config = load_config(args.config)
@@ -410,36 +230,16 @@ def main() -> None:
 
     url = build_url(config)
     headers = build_headers(config)
+    api_filters = config.get("api_filters", [])
+
     page_size = min(
         max(int(config.get("page_size", MAX_PAGE_SIZE)), 1),
         MAX_PAGE_SIZE,
     )
+    output_file = str(config.get("output", "issues.csv"))
     max_retries = int(config.get("retry_count", 5))
     timeout = int(config.get("timeout", 60))
     compress = bool(config.get("gzip", False))
-
-    use_menu = (
-        args.interactive
-        or (
-            not args.non_interactive
-            and sys.stdin.isatty()
-        )
-    )
-
-    if use_menu:
-        api_filters = build_interactive_api_filters()
-        suggested_output = default_output_name(api_filters)
-        output_answer = input(
-            f"\nOutput filename [{suggested_output}]: "
-        ).strip()
-        output_file = output_answer or suggested_output
-
-        if not confirm_export(api_filters, output_file):
-            print("Export cancelled.")
-            return
-    else:
-        api_filters = config.get("api_filters", [])
-        output_file = str(config.get("output", "issues.csv"))
 
     if compress and not output_file.endswith(".gz"):
         output_file += ".gz"
@@ -448,7 +248,7 @@ def main() -> None:
         os.remove(output_file)
 
     search_from = 0
-    downloaded = 0
+    exported = 0
     page_number = 0
     filtered_count: Optional[int] = None
     writer: Optional[csv.DictWriter] = None
@@ -456,14 +256,14 @@ def main() -> None:
     started_at = time.time()
     session = requests.Session()
 
-    print("\n" + "=" * 72)
+    print("=" * 72)
     print(" Cortex Cloud Issues Exporter")
     print("=" * 72)
     print(f"Endpoint       : {url}")
     print(f"Page size      : {page_size}")
     print(f"Output         : {output_file}")
     print(f"Started        : {datetime.now(timezone.utc).isoformat()}")
-    print_filter_summary(api_filters)
+    print_filters(api_filters)
     print("=" * 72)
 
     try:
@@ -492,7 +292,6 @@ def main() -> None:
                 )
 
             api_filter_count = reply.get("FILTER_COUNT")
-
             if isinstance(api_filter_count, int):
                 filtered_count = api_filter_count
 
@@ -527,9 +326,9 @@ def main() -> None:
             if csv_file is not None:
                 csv_file.flush()
 
-            downloaded += len(issues)
+            exported += len(issues)
             elapsed = time.time() - started_at
-            rate = downloaded / elapsed if elapsed > 0 else 0
+            rate = exported / elapsed if elapsed > 0 else 0
             target = (
                 str(filtered_count)
                 if filtered_count is not None
@@ -538,7 +337,7 @@ def main() -> None:
 
             print(
                 f"\rPage {page_number:>5} | "
-                f"Exported {downloaded:>8}/{target:<8} | "
+                f"Exported {exported:>8}/{target:<8} | "
                 f"{rate:>7.1f} issues/sec",
                 end="",
                 flush=True,
@@ -546,7 +345,7 @@ def main() -> None:
 
             search_from += len(issues)
 
-            if filtered_count is not None and downloaded >= filtered_count:
+            if filtered_count is not None and exported >= filtered_count:
                 break
 
             if len(issues) < page_size:
@@ -554,7 +353,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print("\n\nExport interrupted by the user.")
-        print(f"Exported before interruption: {downloaded}")
+        print(f"Exported before interruption: {exported}")
         sys.exit(130)
 
     except Exception as error:
@@ -579,7 +378,7 @@ def main() -> None:
     print(" Export complete")
     print("=" * 72)
     print(f"Filtered count : {filtered_count}")
-    print(f"Exported       : {downloaded} issues")
+    print(f"Exported       : {exported} issues")
     print(f"Pages          : {page_number}")
     print(f"Output         : {output_file}")
     print(f"File size      : {file_size_mb:.2f} MB")
